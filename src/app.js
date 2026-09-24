@@ -1,431 +1,216 @@
-﻿import 'dotenv/config';
-import { Client, Collection, GatewayIntentBits } from 'discord.js';
-import { REST } from '@discordjs/rest';
-import express from 'express';
-import cron from 'node-cron';
+import "dotenv/config";
+import {
+ Client, GatewayIntentBits, Events, REST, Routes,
+ ActionRowBuilder, ButtonBuilder, ButtonStyle,
+ UserSelectMenuBuilder, StringSelectMenuBuilder,
+ ModalBuilder, TextInputBuilder, TextInputStyle,
+ ContainerBuilder, TextDisplayBuilder, MessageFlags,
+ PermissionFlagsBits
+} from "discord.js";
 
-import config from './config/application.js';
-import { initializeDatabase } from './utils/database.js';
-import { getGuildConfig } from './services/config/guildConfig.js';
-import { getServerCounters, saveServerCounters, updateCounter } from './services/serverstatsService.js';
-import { logger, startupLog, shutdownLog } from './utils/logger.js';
-import { checkBirthdays } from './services/birthdayService.js';
-import { checkGiveaways } from './services/giveawayService.js';
-import { loadCommands, registerCommands as registerSlashCommands } from './handlers/loaders/commandLoader.js';
-import { runSafeTask, handleTaskError, ErrorCodes } from './utils/errorHandler.js';
-import { initializeMusic } from './services/music/riffySetup.js';
-import { shutdownMusic } from './services/music/playerHandler.js';
-import pkg from '../package.json' with { type: 'json' };
-import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
-
-class TitanBot extends Client {
-  constructor() {
-    super({
-      intents: [
-        
-        GatewayIntentBits.Guilds,                        
-        GatewayIntentBits.GuildMembers,                 
-
-        GatewayIntentBits.GuildMessages,                
-        GatewayIntentBits.GuildMessageReactions,        
-        GatewayIntentBits.MessageContent,               
-        GatewayIntentBits.DirectMessages,
-
-        GatewayIntentBits.GuildVoiceStates,             
-
-        GatewayIntentBits.GuildBans,                    
-      ],
-    });
-
-    this.config = config;
-    this.commands = new Collection();
-    this.events = new Collection();
-    this.buttons = new Collection();
-    this.selectMenus = new Collection();
-    this.modals = new Collection();
-    this.cooldowns = new Collection();
-    this.db = null;
-    this.rest = new REST({ version: '10' }).setToken(config.bot.token);
-  }
-
-  async start() {
-    try {
-      startupLog('Starting TitanBot...');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      startupLog('Initializing database...');
-      const dbInstance = await initializeDatabase();
-      this.db = dbInstance.db;
-
-      // Check database status and report
-      const dbStatus = this.db.getStatus();
-      if (dbStatus.isDegraded) {
-        logger.warn('');
-        logger.warn('╔═══════════════════════════════════════════════════════╗');
-        logger.warn('║ ⚠️  DATABASE RUNNING IN DEGRADED MODE                 ║');
-        logger.warn('║                                                       ║');
-        logger.warn('║ Connection: In-Memory Storage (PostgreSQL unavailable)║');
-        logger.warn('║ Data Persistence: DISABLED - data lost on restart    ║');
-        logger.warn('║ Action Required: Fix PostgreSQL and restart bot      ║');
-        logger.warn('╚═══════════════════════════════════════════════════════╝');
-        logger.warn('');
-      } else {
-        startupLog(`✅ Database Status: ${dbStatus.connectionType} (fully operational)`);
-      }
-      
-      startupLog('Starting web server...');
-      this.startWebServer();
-      
-      startupLog('Loading commands...');
-      await loadCommands(this);
-      startupLog(`Commands loaded: ${this.commands.size}`);
-      
-      startupLog('Loading handlers...');
-      await this.loadHandlers();
-      startupLog('Handlers loaded');
-
-      initializeMusic(this);
-      
-      startupLog('Logging into Discord...');
-      await this.login(this.config.bot.token);
-      startupLog('Discord login successful');
-      
-      startupLog('Registering slash commands globally...');
-      await this.registerCommands();
-      startupLog('Slash commands registration complete');
-      
-      const databaseMode = dbStatus.isDegraded
-        ? 'Optional in-memory mode (data resets after restart)'
-        : 'Connected (persistent data enabled)';
-      const handlerSummary = `${this.buttons.size} buttons, ${this.selectMenus.size} menus, ${this.modals.size} modals`;
-      startupLog(
-        `ONLINE ✅ | ${this.commands.size} commands loaded | ${handlerSummary} | Database: ${databaseMode}`
-      );
-      
-      this.setupCronJobs();
-    } catch (error) {
-      logger.error('Failed to start bot:', error);
-      process.exit(1);
-    }
-  }
-
-  startWebServer() {
-    const app = express();
-    const configuredPort = Number(this.config.api?.port || process.env.PORT || 3000);
-    const maxPortRetryAttempts = Number(process.env.PORT_RETRY_ATTEMPTS || 5);
-    const host = process.env.WEB_HOST || '0.0.0.0';
-    const corsOrigin = this.config.api?.cors?.origin || '*';
-    
-    app.use((req, res, next) => {
-      const allowedOrigins = Array.isArray(corsOrigin) ? corsOrigin : [corsOrigin];
-      const origin = req.headers.origin;
-      
-      if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin || '*');
-      }
-      res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-      
-      if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-      }
-      next();
-    });
-
-    const requestCounts = new Map();
-    const windowMs = this.config.api?.rateLimit?.windowMs || 60000;
-    const maxRequests = this.config.api?.rateLimit?.max || 100;
-    
-    app.use((req, res, next) => {
-      const ip = req.ip;
-      const now = Date.now();
-      const windowStart = now - windowMs;
-      
-      if (!requestCounts.has(ip)) {
-        requestCounts.set(ip, []);
-      }
-      
-      const times = requestCounts.get(ip).filter(t => t > windowStart);
-      
-      if (times.length >= maxRequests) {
-        return res.status(429).json({ error: 'Too many requests' });
-      }
-      
-      times.push(now);
-      requestCounts.set(ip, times);
-      next();
-    });
-
-    app.get('/health', (req, res) => {
-      const dbStatus = this.db?.getStatus?.() || { isDegraded: 'unknown' };
-      const status = {
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        database: {
-          connected: dbStatus.connectionType !== 'none',
-          degraded: dbStatus.isDegraded,
-          type: dbStatus.connectionType
-        }
-      };
-      res.status(200).json(status);
-    });
-
-    app.get('/ready', (req, res) => {
-      const dbStatus = this.db?.getStatus?.() || { isDegraded: true, connectionType: 'none' };
-      const isReady = this.isReady() && !dbStatus.isDegraded;
-
-      const metrics = {
-        guildCount: this.guilds?.cache?.size ?? 0,
-        commandCount: this.commands?.size ?? 0,
-        database: {
-          mode: dbStatus.connectionType,
-          degraded: dbStatus.isDegraded,
-          degradedReason: dbStatus.degradedReason ?? null,
-        },
-        schemaVersion: EXPECTED_SCHEMA_VERSION,
-        schemaLabel: EXPECTED_SCHEMA_LABEL,
-      };
-
-      if (isReady) {
-        return res.status(200).json({
-          ready: true,
-          message: 'Bot is ready',
-          metrics,
-        });
-      }
-
-      res.status(503).json({
-        ready: false,
-        reason: !this.isReady() ? 'Bot not Ready' : 'Database degraded',
-        metrics,
-      });
-    });
-
-    app.get('/', (req, res) => {
-      res.status(200).json({ 
-        message: 'TitanBot System Online',
-        version: pkg.version,
-        timestamp: new Date().toISOString()
-      });
-    });
-
-    const startServer = (port, attempt = 0) => {
-      let hasStartedListening = false;
-      const server = app.listen(port, host, () => {
-        hasStartedListening = true;
-        this.webServer = server;
-        startupLog(`✅ Web Server running on ${host}:${port}`);
-        startupLog(`Health endpoint: http://${host}:${port}/health`);
-        startupLog(`Ready endpoint: http://${host}:${port}/ready`);
-      });
-
-      server.on('error', (error) => {
-        const errorCode = error?.code || 'UNKNOWN_ERROR';
-        const errorMessage = error?.message || 'Unknown server error';
-
-        if (!hasStartedListening && errorCode === 'EADDRINUSE' && attempt < maxPortRetryAttempts) {
-          const nextPort = port + 1;
-          startupLog(`Port ${port} is already in use. Trying port ${nextPort}...`);
-          setTimeout(() => startServer(nextPort, attempt + 1), 250);
-          return;
-        }
-
-        if (hasStartedListening && errorCode === 'EADDRINUSE') {
-          logger.warn(`Web server reported a duplicate bind warning on ${host}:${port}, but the bot remains online.`);
-          return;
-        }
-
-        logger.error(`❌ Web server error on port ${port} (${errorCode}): ${errorMessage}`);
-
-        if (!hasStartedListening) {
-          process.exit(1);
-        }
-      });
-    };
-
-    startServer(configuredPort, 0);
-  }
-
-  setupCronJobs() {
-    cron.schedule('0 6 * * *', runSafeTask('birthday_check', () => checkBirthdays(this)));
-    cron.schedule('* * * * *', runSafeTask('giveaway_check', () => checkGiveaways(this)));
-    cron.schedule('*/15 * * * *', runSafeTask('counter_update', () => this.updateAllCounters()));
-  }
-
-  async updateAllCounters() {
-    if (!this.db) {
-      logger.warn('Database not available for counter updates');
-      return;
-    }
-    
-    for (const [guildId, guild] of this.guilds.cache) {
-      try {
-        const counters = await getServerCounters(this, guildId);
-        const validCounters = [];
-        const orphanedCounters = [];
-        
-        for (const counter of counters) {
-          if (counter && counter.type && counter.channelId && counter.enabled !== false) {
-            const channel = guild.channels.cache.get(counter.channelId);
-            if (channel) {
-              validCounters.push(counter);
-              await updateCounter(this, guild, counter);
-            } else {
-              orphanedCounters.push(counter);
-              logger.info(`Removing orphaned counter ${counter.id} (type: ${counter.type}, deleted channel: ${counter.channelId}) from guild ${guildId}`);
-            }
-          }
-        }
-        
-        // Save cleaned counters if any were orphaned
-        // Save cleaned counters if any were orphaned
-        if (orphanedCounters.length > 0) {
-          await saveServerCounters(this, guildId, validCounters);
-          logger.info(`Cleaned up ${orphanedCounters.length} orphaned counter(s) from guild ${guildId} during scheduled update`);
-        }
-      } catch (error) {
-        logger.error(`Error updating counters for guild ${guildId}:`, error);
-      }
-    }
-  }
-
-  async loadHandlers() {
-    startupLog('Loading handlers...');
-    const handlers = [
-      { path: 'events', type: 'default', required: true },
-      { path: 'interactions', type: 'default', required: true }
-    ];
-
-    for (const handler of handlers) {
-      try {
-        startupLog(`Loading handler: ${handler.path}`);
-        const module = await import(`./handlers/loaders/${handler.path}.js`);
-        const loaderFn = handler.type.startsWith('named:')
-          ? module[handler.type.split(':')[1]]
-          : module.default;
-
-        if (typeof loaderFn === 'function') {
-          await loaderFn(this);
-          startupLog(`✅ Loaded ${handler.path}`);
-        } else {
-          throw new Error(`Invalid loader export from ${handler.path}`);
-        }
-      } catch (error) {
-        if (handler.required) {
-          logger.error(`❌ Failed to load required handler ${handler.path}:`, error.message);
-          throw error;
-        } else if (error.code !== 'MODULE_NOT_FOUND') {
-          logger.warn(`⚠️  Failed to load optional handler ${handler.path}:`, error.message);
-        }
-      }
-    }
-  }
-
-  async registerCommands() {
-    try {
-      await registerSlashCommands(this, { clientId: this.config.bot.clientId });
-    } catch (error) {
-      logger.error('Error registering commands:', error);
-    }
-  }
-
-  async shutdown(reason = 'UNKNOWN') {
-    shutdownLog(`Bot is shutting down (${reason})...`);
-    logger.info(`\n${'='.repeat(60)}`);
-    logger.info(`🛑 Graceful Shutdown Initiated (${reason})`);
-    logger.info(`${'='.repeat(60)}`);
-
-    try {
-      
-      logger.info('Stopping cron jobs...');
-      cron.getTasks().forEach(task => task.stop());
-      logger.info('✅ Cron jobs stopped');
-
-      logger.info('Stopping music players...');
-      await shutdownMusic(this);
-      logger.info('✅ Music players stopped');
-
-      if (this.webServer) {
-        logger.info('Closing web server...');
-        await new Promise((resolve) => this.webServer.close(resolve));
-        logger.info('✅ Web server closed');
-      }
-
-      // Close database connection
-      // Close database connection
-      if (this.db && this.db.db) {
-        logger.info('Closing database connection...');
-        try {
-          if (this.db.db.pool) {
-            await this.db.db.pool.end();
-            logger.info('✅ Database connection closed');
-          }
-        } catch (error) {
-          logger.warn('Error closing database pool:', error.message);
-        }
-      }
-
-      logger.info('Destroying Discord client...');
-      if (this.isReady()) {
-        try {
-          this.destroy();
-          logger.info('✅ Discord client destroyed');
-        } catch (error) {
-
-          logger.warn('Discord client destroy warning (non-critical):', error.message);
-        }
-      }
-
-      logger.info('✅ Graceful shutdown complete');
-  shutdownLog('Bot stopped successfully.');
-      process.exit(0);
-    } catch (error) {
-      logger.error('Error during graceful shutdown:', error);
-      process.exit(1);
-    }
-  }
+const C={
+ token:process.env.DISCORD_TOKEN,
+ clientId:process.env.CLIENT_ID,
+ guildId:process.env.GUILD_ID,
+ staffRoleId:process.env.STAFF_ROLE_ID,
+ resultsChannelId:process.env.APPLICATION_RESULTS_CHANNEL_ID,
+ buyerRoleId:process.env.BUYER_ROLE_ID
+};
+for(const k of ["token","clientId","guildId","staffRoleId","resultsChannelId","buyerRoleId"]){
+ if(!C[k]) throw new Error("Missing .env value: "+k);
 }
 
-try {
-  const bot = new TitanBot();
-  
-  const setupShutdown = () => {
-    process.on('SIGTERM', () => bot.shutdown('SIGTERM'));
-    process.on('SIGINT', () => bot.shutdown('SIGINT'));
-    
-    process.on('uncaughtException', (error) => {
-      // Process state may be corrupt after an uncaught throw; log and shut down cleanly.
-      handleTaskError('uncaught_exception', error, { fatal: true });
-      bot.shutdown('UNCAUGHT_EXCEPTION');
-    });
+const TYPES=[
+ ["Livery Creator","livery"],
+ ["Uniform Creator","uniform"],
+ ["Discord Server Creator","server"]
+];
+const GREEN=0x57F287, RED=0xED4245, BLUE=0x5865F2;
+const client=new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildMembers]});
+const panels=new Map();
 
-    process.on('unhandledRejection', (reason) => {
-      const code = reason?.code;
-      if (code === 10062 || code === 40060 || code === 50027) {
-        logger.warn('Recoverable Discord interaction rejection:', reason?.message || reason);
-        return;
-      }
-      if (reason?.message?.includes('Queue is empty')) {
-        return;
-      }
-
-      // A stray rejection is a bug to fix, not a reason to take the bot down.
-      // Log loudly with full context; the central task handler categorizes it.
-      handleTaskError('unhandled_rejection', reason instanceof Error ? reason : new Error(String(reason)), {
-        errorCode: ErrorCodes.UNHANDLED_REJECTION,
-      });
-    });
-  };
-  
-  setupShutdown();
-  bot.start().catch((error) => {
-    logger.error('Fatal error during bot startup:', error);
-    bot.shutdown('STARTUP_ERROR');
-  });
-} catch (error) {
-  logger.error('Fatal error during bot startup:', error);
-  process.exit(1);
+const typeName=v=>(TYPES.find(x=>x[1]===v)||["Unknown",v])[0];
+function staff(i){
+ if(!i.guild)return false;
+ const owners=(process.env.OWNER_IDS||"").split(",").map(x=>x.trim()).filter(Boolean);
+ return owners.includes(i.user.id)||Boolean(i.member?.roles?.cache?.has(C.staffRoleId));
+}
+async function staffOnly(i){
+ if(staff(i))return true;
+ const v=new ContainerBuilder().setAccentColor(RED).addTextDisplayComponents(
+  new TextDisplayBuilder().setContent("# ❌ Permission Denied\nYou do not have permission to use this command.")
+ );
+ await i.reply({components:[v],flags:MessageFlags.IsComponentsV2|MessageFlags.Ephemeral});
+ return false;
+}
+function newPanel(i,mode){
+ const id=Math.random().toString(36).slice(2,12)+Date.now().toString(36);
+ panels.set(id,{owner:i.user.id,mode,users:[],type:null});
+ setTimeout(()=>panels.delete(id),900000);
+ return id;
+}
+function getPanel(i,id){
+ const p=panels.get(id);
+ return p&&p.owner===i.user.id?p:null;
+}
+function makePanel(mode,id){
+ const bulk=mode.startsWith("bulk"), accept=mode.includes("accept");
+ const users=new UserSelectMenuBuilder()
+  .setCustomId("users:"+id)
+  .setPlaceholder(bulk?"Select one or more users":"Select the applicant")
+  .setMinValues(1).setMaxValues(bulk?25:1);
+ const types=new StringSelectMenuBuilder()
+  .setCustomId("type:"+id)
+  .setPlaceholder("Select the application type")
+  .addOptions(TYPES.map(x=>({label:x[0],value:x[1]})));
+ const go=new ButtonBuilder()
+  .setCustomId("action:"+id)
+  .setLabel(accept?"Accept Application":"Deny Application")
+  .setStyle(accept?ButtonStyle.Success:ButtonStyle.Danger)
+  .setEmoji(accept?"✅":"❌");
+ const cancel=new ButtonBuilder().setCustomId("cancel:"+id).setLabel("Cancel").setStyle(ButtonStyle.Secondary);
+ return new ContainerBuilder().setAccentColor(accept?GREEN:RED)
+  .addTextDisplayComponents(new TextDisplayBuilder().setContent(
+   "# "+(accept?"✅ Accept Application":"❌ Deny Application")+"\nSelect "+(bulk?"the applicants":"the applicant")+" and the application type, then press the button."
+  ))
+  .addActionRowComponents(new ActionRowBuilder().addComponents(users))
+  .addActionRowComponents(new ActionRowBuilder().addComponents(types))
+  .addActionRowComponents(new ActionRowBuilder().addComponents(go,cancel));
+}
+function resultView(text,color){
+ return new ContainerBuilder().setAccentColor(color).addTextDisplayComponents(new TextDisplayBuilder().setContent(text));
+}
+function resultModal(id,accepted){
+ const input=new TextInputBuilder()
+  .setCustomId(accepted?"notes":"reason")
+  .setLabel(accepted?"Notes (optional)":"Reason")
+  .setStyle(TextInputStyle.Paragraph)
+  .setRequired(!accepted).setMaxLength(1000);
+ return new ModalBuilder().setCustomId("result:"+id).setTitle(accepted?"Accept Application":"Deny Application")
+  .addComponents(new ActionRowBuilder().addComponents(input));
+}
+async function postResult(i,p,accepted,extra){
+ const ch=await i.guild.channels.fetch(C.resultsChannelId).catch(()=>null);
+ if(!ch?.isTextBased())throw new Error("Application results channel is invalid or inaccessible.");
+ const mentions=p.users.map(u=>"<@"+u.id+">").join("\n");
+ let text;
+ if(accepted){
+  text="# ✅ Application Accepted\n**Applicant(s):**\n"+mentions+"\n\n**Application Type:** "+typeName(p.type)+"\n**Accepted By:** "+i.user;
+  if(extra)text+="\n\n**Notes:**\n"+extra;
+ }else{
+  text="# ❌ Application Denied\n**Applicant(s):**\n"+mentions+"\n\n**Application Type:** "+typeName(p.type)+"\n**Denied By:** "+i.user+"\n\n**Reason:**\n"+extra;
+ }
+ await ch.send({
+  components:[resultView(text,accepted?GREEN:RED)],
+  flags:MessageFlags.IsComponentsV2,
+  allowedMentions:{users:p.users.map(u=>u.id)}
+ });
 }
 
-export default TitanBot;
+const commands=[
+ {name:"accept",description:"Accept an application."},
+ {name:"deny",description:"Deny an application."},
+ {name:"bulk",description:"Bulk application actions.",options:[
+  {type:1,name:"accept",description:"Accept applications for multiple users."},
+  {type:1,name:"deny",description:"Deny applications for multiple users."}
+ ]},
+ {name:"grant",description:"Give the Buyer role to a member.",options:[
+  {type:6,name:"user",description:"Member to receive Buyer role.",required:true}
+ ]},
+ {name:"robux",description:"Calculate Roblox 30% tax.",options:[
+  {type:4,name:"amount",description:"Robux amount before tax.",required:true,min_value:1}
+ ]}
+];
+
+client.once(Events.ClientReady,async c=>{
+ console.log("Logged in as "+c.user.tag);
+ const rest=new REST({version:"10"}).setToken(C.token);
+ const route=C.guildId?Routes.applicationGuildCommands(C.clientId,C.guildId):Routes.applicationCommands(C.clientId);
+ await rest.put(route,{body:commands});
+ console.log("Registered "+commands.length+" slash commands.");
+});
+
+client.on(Events.InteractionCreate,async i=>{
+ try{
+  if(i.isChatInputCommand()){
+   if(!(await staffOnly(i)))return;
+   if(i.commandName==="accept"||i.commandName==="deny"){
+    const id=newPanel(i,i.commandName);
+    return i.reply({components:[makePanel(i.commandName,id)],flags:MessageFlags.IsComponentsV2|MessageFlags.Ephemeral});
+   }
+   if(i.commandName==="bulk"){
+    const sub=i.options.getSubcommand(),id=newPanel(i,"bulk_"+sub);
+    return i.reply({components:[makePanel("bulk_"+sub,id)],flags:MessageFlags.IsComponentsV2|MessageFlags.Ephemeral});
+   }
+   if(i.commandName==="grant"){
+    const u=i.options.getUser("user",true);
+    const m=await i.guild.members.fetch(u.id).catch(()=>null);
+    if(!m)return i.reply({content:"❌ That user is not in this server.",ephemeral:true});
+    const role=await i.guild.roles.fetch(C.buyerRoleId).catch(()=>null);
+    if(!role)return i.reply({content:"❌ BUYER_ROLE_ID is invalid.",ephemeral:true});
+    const me=i.guild.members.me;
+    if(!me?.permissions.has(PermissionFlagsBits.ManageRoles))return i.reply({content:"❌ I need Manage Roles.",ephemeral:true});
+    if(role.position>=me.roles.highest.position)return i.reply({content:"❌ The Buyer role must be below my highest role.",ephemeral:true});
+    if(m.roles.cache.has(role.id))return i.reply({content:"ℹ️ "+m+" already has the Buyer role.",ephemeral:true});
+    await m.roles.add(role,"Buyer role granted by "+i.user.tag);
+    return i.reply({content:"✅ Granted the Buyer role to "+m+".",ephemeral:true});
+   }
+   if(i.commandName==="robux"){
+    const amount=i.options.getInteger("amount",true),after=Math.floor(amount*.7),tax=amount-after,needed=Math.ceil(amount/.7);
+    return i.reply({embeds:[{title:"💰 Robux Tax Calculator",color:BLUE,fields:[
+     {name:"Before Tax",value:amount.toLocaleString()+" Robux",inline:true},
+     {name:"30% Tax",value:tax.toLocaleString()+" Robux",inline:true},
+     {name:"After Tax",value:after.toLocaleString()+" Robux",inline:true},
+     {name:"To Receive This Amount",value:needed.toLocaleString()+" Robux before tax"}
+    ]}],ephemeral:true});
+   }
+  }
+
+  if(i.isUserSelectMenu()&&i.customId.startsWith("users:")){
+   const id=i.customId.slice(6),p=getPanel(i,id);
+   if(!p)return i.reply({content:"❌ Panel expired. Run the command again.",ephemeral:true});
+   p.users=i.values.map(x=>i.guild.members.cache.get(x)?.user).filter(Boolean);
+   return i.deferUpdate();
+  }
+
+  if(i.isStringSelectMenu()&&i.customId.startsWith("type:")){
+   const id=i.customId.slice(5),p=getPanel(i,id);
+   if(!p)return i.reply({content:"❌ Panel expired. Run the command again.",ephemeral:true});
+   p.type=i.values[0];
+   return i.deferUpdate();
+  }
+
+  if(i.isButton()){
+   const parts=i.customId.split(":"),action=parts[0],id=parts[1],p=getPanel(i,id);
+   if(!p)return i.reply({content:"❌ Panel expired. Run the command again.",ephemeral:true});
+   if(action==="cancel"){
+    panels.delete(id);
+    return i.update({components:[resultView("# 🚫 Cancelled\nThe application action was cancelled.",BLUE)],flags:MessageFlags.IsComponentsV2|MessageFlags.Ephemeral});
+   }
+   if(p.users.length===0||!p.type)return i.reply({content:"❌ Select the applicant(s) and application type first.",ephemeral:true});
+   return i.showModal(resultModal(id,p.mode.includes("accept")));
+  }
+
+  if(i.isModalSubmit()&&i.customId.startsWith("result:")){
+   const id=i.customId.slice(7),p=getPanel(i,id);
+   if(!p)return i.reply({content:"❌ Panel expired. Run the command again.",ephemeral:true});
+   const accepted=p.mode.includes("accept"),extra=i.fields.getTextInputValue(accepted?"notes":"reason");
+   await i.deferUpdate();
+   await postResult(i,p,accepted,extra);
+   panels.delete(id);
+   return i.editReply({
+    components:[resultView(accepted?"# ✅ Application Accepted\nThe result was posted successfully.":"# ❌ Application Denied\nThe result was posted successfully.",accepted?GREEN:RED)],
+    flags:MessageFlags.IsComponentsV2|MessageFlags.Ephemeral
+   });
+  }
+ }catch(e){
+  console.error("Interaction error:",e);
+  const d={content:"❌ Something went wrong while processing that action.",ephemeral:true};
+  if(i.replied||i.deferred)await i.followUp(d).catch(()=>{});else await i.reply(d).catch(()=>{});
+ }
+});
+
+client.on(Events.Error,e=>console.error("Discord client error:",e));
+process.on("SIGINT",()=>{client.destroy();process.exit(0)});
+process.on("SIGTERM",()=>{client.destroy();process.exit(0)});
+client.login(C.token);
